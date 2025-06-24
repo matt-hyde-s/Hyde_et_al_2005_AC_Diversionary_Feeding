@@ -1,0 +1,715 @@
+---
+title: "Diversionary_feeding"
+date: "2024-03-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(GGally)
+library(rjags)
+library(coda)
+library(MCMCvis)
+library(HDInterval)
+library(stringr)
+library(cowplot)
+library(ggmcmc)
+library(ggbreak)
+library(hrbrthemes)
+library(MetBrewer)
+library(jpeg)
+library(patchwork)
+```
+
+# Introduction
+
+In this model, we import the data and estimate depredations before and after the use of diversionary feeding. We used zero inflation to account for non-detected (aka reported or verified losses). Because there was the outlying question of whether the reduction could be attributed to temporal changes in prey vulnerability, we ran the subset model to see if there were any differences. 
+
+```{r, warning = FALSE}
+# load data
+load('div_feeding_data.Rdata') # main dataset
+load('div_feeding_data_sub.Rdata') # sub model of prey
+
+ggpairs(dat, c(11:13)) # check correlation of detection covariates
+ggpairs(dat, c(7,14,15)) # check correlation of depredation covariates
+
+
+#scale covariates for detection
+dat$forest_scaled = scale(dat$forest,center=TRUE, scale=TRUE)
+dat$slope_scaled = scale(dat$slope,center=TRUE, scale=TRUE)
+dat$roads_scaled = scale(dat$roads_area,center=TRUE, scale=TRUE)
+
+#scale covariates for depredation
+dat$Size_scaled = scale(dat$Size,center=TRUE, scale=TRUE)
+dat$prey_scaled = scale(dat$prey,center=TRUE, scale=TRUE)
+dat$cattle_scaled = scale(dat$cattle,center=TRUE, scale=TRUE)
+
+```
+
+# Prepare Jags model
+
+```{r, warning = FALSE}
+
+## settings just to try it. The whole script takes ~6 mins with these settings
+n.adapt = 2500
+n.update = 1000
+n.iter = 10000
+n.thin = 2
+
+## settings for actual model. The script will take ~1.5 hours with these settings
+#n.adapt = 100000
+#n.update = 10000
+#n.iter = 250000
+#n.thin = 5
+
+# initial values for MCMC chains
+inits = list(
+  list(b1 = 0, b2 = .01, b3 = 1.6,
+       ba1 = 0, ba2 = .01, ba3 = 1.6,
+       a1 = .75, a2 = .5, a3 = .1),
+  list(b1 = 2, b2 = .0005, b3 = .06,
+       ba1 = 2, ba2 = .0005, ba3 = .06,
+       a1 = .9, a2 = .005, a3 = 10),
+  list(b1 = 0, b2 = 1, b3 = 1.6,
+       ba1 = 0, ba2 = 1, ba3 = 1.6, 
+      a1 = 0, a2 = 1, a3 = .06),
+  list(b1 = .001, b2 = 2.5, b3 = -1.3,
+       ba1 = .001, ba2 = 2.5, ba3 = -1.3,
+       a1 = -.8, a2 = -1, a3 = -.06))
+
+#create regional intercept (NM is 2, AZ is 1) 
+dat <- dat %>%
+  mutate(graz1 = ifelse(graz ==0,1,2))
+
+Mod <- dat # conserve original data file
+Mod$new = Mod$Before_3months + Mod$After_3months
+
+# Calculate z-value for zero inflation 
+Mod <- Mod %>%
+  mutate(Z = ifelse(new == 0,0,1))
+
+# data list for JAGS
+D = list(
+  Yb = Mod$Before_3months,
+  Ya = Mod$After_3months,
+  pSize = as.double(Mod$Size_scaled), 
+  prey = as.double(Mod$prey_scaled),
+  cattle = as.double(Mod$cattle_scaled),
+  n = length(Mod$Pack),
+  s = as.double(Mod$slope_scaled),
+  f = as.double(Mod$forest_scaled),
+  r = as.double(Mod$roads_scaled),
+  St = Mod$graz1,
+  z = Mod$Z)
+
+
+```
+
+
+# Model
+
+This is the full model to be run in jags. 
+```{r}
+set.seed(10)
+sink("Mexwolf_poisson.R")
+cat("
+model {
+  #priors
+  # detection process
+   for (j in 1:2){
+   a0[j]~dnorm(0,1/1000)
+  }
+  a1 ~ dlogis(0,1)
+  a2 ~ dlogis(0,1)
+  a3 ~ dlogis(0,1)
+  # depredation (before) process
+  for (j in 1:2){
+   b0[j]~dnorm(0,1/1000)
+  }
+  b1 ~ dnorm(0,1/1000)
+  b2 ~ dnorm(0,1/1000)
+  b3 ~ dnorm(0,1/1000)
+  # depredation (after) process
+  for (j in 1:2){
+   ba0[j]~dnorm(0,1/1000)
+  }
+  ba1 ~ dnorm(0,1/1000)
+  ba2 ~ dnorm(0,1/1000)
+  ba3 ~ dnorm(0,1/1000)
+
+
+#Likelihood for depredation encounter process
+for (i in 1:n) {
+    logit(p[i]) <- a0[St[i]] + a1 * s[i] + a2 * f[i]  + a3 * r[i]
+    z[i] ~ dbern(p[i])
+    sim_z[i] ~ dbern(p[i])
+}    
+
+# likelihood for depredations before
+for (i in 1:n) {
+    Yb[i] ~ dpois(mu[i]*z[i])
+        mu[i] <- exp(b0[St[i]] + b1 * pSize[i] * pSize[i] + b2 * prey[i] + b3 * cattle[i])
+    sim_depredations[i] ~ dpois(mu[i]*z[i])
+} 
+
+# likelihood for depredations after
+for (i in 1:n) {
+    Ya[i] ~ dpois(mu1[i]*z[i])
+        mu1[i] <- exp(ba0[St[i]] + ba1 * pSize[i] * pSize[i] + ba2 * prey[i] + ba3 * cattle[i])
+    sim_depredations1[i] ~ dpois(mu1[i]*z[i])
+}  
+
+#get bayesian p-values for depredation and detection model
+data_mean <- mean(Yb[])
+sim_mean <- mean(sim_depredations[])
+pvalue_mean_dep <- step(sim_mean-data_mean)
+
+data_mean1 <- mean(Ya[])
+sim_mean1 <- mean(sim_depredations1[])
+pvalue_mean_dep_aft <- step(sim_mean1-data_mean1)
+
+data_mean_z <- mean(z[])
+sim_mean_z <- mean(sim_z[])
+pvalue_mean_z <- step(sim_mean_z - data_mean_z)
+
+pmean <- mean(p[])
+sumbef <- sum(mu[])
+sumaft <- sum(mu1[])
+reduc <- sum(mu[])-sum(mu1[])
+diff <- (1-sum(mu1[])/sum(mu[]))
+mu_mean <- mean(mu[])
+mu1_mean <- mean(mu1[])
+means <- mean(mu[])-mean(mu1[])
+}
+", fill = TRUE)
+
+jm = jags.model("Mexwolf_poisson.R", 
+                data = D, 
+                inits = inits, 
+                n.chains = length(inits), 
+                n.adapt = n.adapt)
+
+update(jm, n.iter = n.update)
+
+zm = coda.samples(jm, variable.names = c("diff",
+                                         "reduc",
+                                         "means",
+                                         "sumbef",
+                                         "sumaft",
+                                         "mu_mean",
+                                         "mu1_mean",
+                                         "pmean",
+                                         "p",
+                                         "mu",
+                                         "mu1",
+                                         "b0","b1","b2","b3", 
+                                         "a0","a1","a2","a3",
+                                         "ba0","ba1","ba2","ba3",
+                                         "pvalue_mean_dep",
+                                         "pvalue_mean_dep_aft",
+                                         "pvalue_mean_z"),
+                                          n.iter = n.iter, 
+                                          n.thin = n.thin)
+
+Reduction <- MCMCsummary(zm, params = c("diff", "reduc","means", "sumbef", "sumaft", "pmean")) #  % reduction
+
+Reduction$se <- Reduction$sd / sqrt(73)
+
+means <- MCMCsummary(zm, params = c("mu_mean", "mu1_mean"))
+
+means$se <- means$sd / sqrt(73)
+  
+# Caterpillar plots
+
+MCMCplot(zm,params=c("b0", "b1", "b2", "b3"), 
+         main = "Depredations before div feeding")
+MCMCplot(zm,params=c("a1", "a2", "a3"), 
+         main = "Factors affecting detection before")
+
+MCMCplot(zm,params=c("ba0", "ba1", "ba2", "ba3"), 
+         main = "Depredations after div feeding")
+MCMCplot(zm,params=c("mu"), rank = TRUE, horiz = FALSE, main = "Estimated depredations before")
+MCMCplot(zm,params=c("mu1"), rank = TRUE, horiz = FALSE, main = "Estimated depredations after")
+
+# Assess traceplots
+MCMCtrace(zm, params="p", pdf = F)
+MCMCtrace(zm, params="mu", pdf = F)
+MCMCtrace(zm, params="mu1", pdf = F)
+
+# Get Bayesian p-values
+pvalue_mean_dep <- round(MCMCpstr(zm, params = c("pvalue_mean_dep"),
+func = mean)$pvalue_mean[1], 2)
+
+pvalue_mean_dep_aft <- round(MCMCpstr(zm, params = c("pvalue_mean_dep_aft"),
+func = mean)$pvalue_mean[1], 2) 
+
+pvalue_mean_z <- round(MCMCpstr(zm, params = c("pvalue_mean_z"),
+func = mean)$pvalue_mean[1], 2)
+
+```
+
+## Subset model
+This model is to compare the group that does not have elk calving in the post-treatment period.  
+```{r}
+
+#scale covariates for detection
+sub$forest_scaled = scale(sub$forest,center=TRUE, scale=TRUE)
+sub$slope_scaled = scale(sub$slope,center=TRUE, scale=TRUE)
+sub$roads_scaled = scale(sub$roads_area,center=TRUE, scale=TRUE)
+
+#scale covariates for depredation
+sub$Size_scaled = scale(sub$Size,center=TRUE, scale=TRUE)
+sub$prey_scaled = scale(sub$prey,center=TRUE, scale=TRUE)
+sub$cattle_scaled = scale(sub$cattle,center=TRUE, scale=TRUE)
+
+submod <- sub
+submod$new = submod$Before_3months + submod$After_3months
+
+# Calculate z-value for zero inflation 
+submod <- submod %>%
+  mutate(Z = ifelse(new == 0,0,1))
+
+submod <- submod %>%
+  mutate(graz1 = ifelse(graz ==0,1,2))
+
+# list for JAGS
+Dsub = list(
+  Yb = submod$Before_3months,
+  Ya = submod$After_3months,
+  pSize = as.double(submod$Size_scaled), 
+  prey = as.double(submod$prey_scaled),
+  cattle = as.double(submod$cattle_scaled),
+  n = length(submod$Pack),
+  s = as.double(submod$slope_scaled),
+  f = as.double(submod$forest_scaled),
+  r = as.double(submod$roads_scaled),
+  St = submod$graz1,
+  z = submod$Z)
+
+set.seed(10)
+sink("Mexwolf_poisson.R")
+cat("
+model {
+  #priors
+  # detection process
+   for (j in 1:2){
+   a0[j]~dnorm(0,1/1000)
+  }
+  a1 ~ dlogis(0,1)
+  a2 ~ dlogis(0,1)
+  a3 ~ dlogis(0,1)
+  # depredation (before) process
+  for (j in 1:2){
+   b0[j]~dnorm(0,1/1000)
+  }
+  b1 ~ dnorm(0,1/1000)
+  b2 ~ dnorm(0,1/1000)
+  b3 ~ dnorm(0,1/1000)
+  # depredation (after) process
+  for (j in 1:2){
+   ba0[j]~dnorm(0,1/1000)
+  }
+  ba1 ~ dnorm(0,1/1000)
+  ba2 ~ dnorm(0,1/1000)
+  ba3 ~ dnorm(0,1/1000)
+
+
+#Likelihood for depredation encounter process
+for (i in 1:n) {
+    logit(p[i]) <- a0[St[i]] + a1 * s[i] + a2 * f[i]  + a3 * r[i]
+    z[i] ~ dbern(p[i])
+    sim_z[i] ~ dbern(p[i])
+}    
+
+# likelihood for depredations before
+for (i in 1:n) {
+    Yb[i] ~ dpois(mu[i]*z[i])
+        mu[i] <- exp(b0[St[i]] + b1 * pSize[i] * pSize[i] + b2 * prey[i] + b3 * cattle[i])
+    sim_depredations[i] ~ dpois(mu[i]*z[i])
+} 
+
+# likelihood for depredations after
+for (i in 1:n) {
+    Ya[i] ~ dpois(mu1[i]*z[i])
+        mu1[i] <- exp(ba0[St[i]] + ba1 * pSize[i] * pSize[i] + ba2 * prey[i] + ba3 * cattle[i])
+    sim_depredations1[i] ~ dpois(mu1[i]*z[i])
+}  
+
+#get bayesian p-values for depredation and detection model
+data_mean <- mean(Yb[])
+sim_mean <- mean(sim_depredations[])
+pvalue_mean_dep <- step(sim_mean-data_mean)
+
+data_mean1 <- mean(Ya[])
+sim_mean1 <- mean(sim_depredations1[])
+pvalue_mean_dep_aft <- step(sim_mean1-data_mean1)
+
+data_mean_z <- mean(z[])
+sim_mean_z <- mean(sim_z[])
+pvalue_mean_z <- step(sim_mean_z - data_mean_z)
+
+pmean <- mean(p[])
+sumbef <- sum(mu[])
+sumaft <- sum(mu1[])
+reduc <- sum(mu[])-sum(mu1[])
+diff <- (1-sum(mu1[])/sum(mu[]))
+mu_mean <- mean(mu[])
+mu1_mean <- mean(mu1[])
+means <- mean(mu[])-mean(mu1[])
+}
+", fill = TRUE)
+
+jm_sub = jags.model("Mexwolf_poisson.R", 
+                data = Dsub, 
+                inits = inits, 
+                n.chains = length(inits), 
+                n.adapt = n.adapt)
+
+update(jm_sub, n.iter = n.update)
+
+zm_sub = coda.samples(jm_sub, variable.names = c("diff",
+                                         "reduc",
+                                         "means",
+                                         "sumbef",
+                                         "sumaft",
+                                         "mu_mean",
+                                         "mu1_mean",
+                                         "p",
+                                         "mu",
+                                         "mu1",
+                                         "b0","b1","b2","b3",  
+                                         "a0","a1","a2","a3",
+                                         "ba0","ba1","ba2","ba3",
+                                         "pvalue_mean_dep",
+                                         "pvalue_mean_dep_aft",
+                                         "pvalue_mean_z"),
+                                          n.iter = n.iter, 
+                                          n.thin = n.thin)
+
+Reduction_sub <- MCMCsummary(zm_sub, 
+                             params = c("diff", "reduc","means", 
+                                        "sumbef", "sumaft")) 
+
+Reduction_sub$se <- Reduction_sub$sd / sqrt(47)
+
+p_sub <- MCMCsummary(zm_sub, params = "p")
+
+# Caterpillar plots
+
+MCMCplot(zm_sub,params=c("b0", "b1", "b2", "b3"), 
+         main = "Depredations before div feeding")
+MCMCplot(zm_sub,params=c("a1", "a2", "a3"), 
+         main = "Factors affecting detection before")
+
+MCMCplot(zm_sub,params=c("ba0", "ba1", "ba2", "ba3"), 
+         main = "Depredations after div feeding")
+MCMCplot(zm_sub,params=c("mu"), rank = TRUE, 
+         horiz = FALSE, main = "Estimated depredations before")
+MCMCplot(zm_sub,params=c("mu1"), rank = TRUE, 
+         horiz = FALSE, main = "Estimated depredations after")
+
+# Assess traceplots
+MCMCtrace(zm_sub, params="p", pdf = F)
+MCMCtrace(zm_sub, params="mu", pdf = F)
+MCMCtrace(zm_sub, params="mu1", pdf = F)
+
+```
+
+
+## Extract estimates for the full model
+
+```{r}
+x <-MCMCsummary(zm, params = "p") #  p summary values
+y <-MCMCsummary(zm, params = "mu") #  before div mu summary values
+z <-MCMCsummary(zm,params = "mu1") #  after div mu summary values
+
+colnames(x)[c(1, 2, 3, 5)] <- c("p", "p_sd", "p_lci", "p_uci")
+x$SEp <- x$p_sd / sqrt(length(x)) # calculate SE from SD
+
+colnames(y)[c(1, 2, 3, 5)] <- c("dep_before", "dep_before_sd", "dep_before_lci", "dep_before_uci")
+y$SEdep <- y$dep_before_sd / sqrt(length(y))
+
+colnames(z)[c(1, 2, 3, 5)] <- c("dep_after", "dep_after_sd", "dep_after_lci", "dep_after_uci")
+z$SEdep1 <- z$dep_after_sd / sqrt(length(z))
+
+BM <- Mod %>%
+  arrange(OBJECTID_1)
+
+
+BM <- BM [,c(1,3,6)]
+results<-bind_cols(BM,x,y,z) # bind together detection, depredation and original data
+
+
+# predictor estimates w/ 95% and 75% BCI
+betas95 <- MCMCsummary(zm, params = c("b0", "b1", "b2", "b3"))
+betas75 <- MCMCsummary(zm, params = c("b0", "b1", "b2", "b3"), probs = c(.125,.875))
+
+betasafter <- MCMCsummary(zm, params = c("ba0", "ba1", "ba2", "ba3"))
+betasafter75 <- MCMCsummary(zm, params = c("ba0", "ba1", "ba2", "ba3"), probs = c(.125,.875))
+# alpha 
+alphas_est <- MCMCsummary(zm, params = c("a0", "a1", "a2", "a3"))
+alphas75 <- MCMCsummary(zm, params = c("a0", "a1", "a2", "a3"), probs = c(.125,.875))
+
+suppressWarnings(remove(x,y,Modbefore,z, inits, BM))
+
+```
+
+
+### Detection means and annual stats
+
+```{r}
+results <- as.data.frame(results)
+p_means <- results %>%
+  summarise(mean_p = mean(p), 
+            lci = mean(p_lci),
+            uci = mean(p_uci),
+            se = mean(SEp)
+            ) 
+
+annual_det <- results %>%
+  group_by(Year) %>%
+  summarise(mean_p = mean(p), 
+            lci = mean(p_lci),
+            uci = mean(p_uci),
+            se = mean(SEp))
+
+
+ALL <- left_join(results, morts, by = c("Pack", "Year"))
+ALL$Size <- dat$Size
+
+ALL$FIN <- ALL$dep_after > ALL$dep_before
+
+ALL <- ALL %>% filter(FIN == "TRUE")
+
+
+
+```
+
+
+# Visuals of the model
+
+## Depredation
+```{r}
+mean_before <- mean(results$dep_before)
+mean_after <- mean(results$dep_after)
+
+means = coda.samples(jm, variable.names = c("mu_mean","mu1_mean"), 
+                     n.iter = n.iter, n.thin = n.thin)
+df_means <- ggs(means)
+mu_bef <- df_means |> filter(Parameter == "mu_mean")
+mu_af <- df_means |> filter(Parameter == "mu1_mean")
+mean_before <- mean(mu_bef$value)
+mean_after <- mean(mu_af$value)
+
+
+densityNL <- ggplot()+
+  geom_density(data = mu_bef, mapping =aes(x=value, fill = "Before",..scaled..),
+               alpha=.85)+
+  geom_density(data = mu_af,mapping =aes(x=value, fill = "After",..scaled..),
+               alpha =.85)+
+  geom_vline(xintercept = mean_before, color = "#99610a",lwd=2, linetype = 2)+
+  geom_vline(xintercept = mean_after, color = "#6f948c",lwd=2, linetype = 2)+
+  labs(x= "Depredations per pack-year", 
+       y="Posterior density", 
+       title = "(a)")+
+  theme_half_open()+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=15,face="bold"), 
+        legend.position = "NONE")+
+  scale_fill_manual(name='Estimates',
+                     values=c("#6f948c","#99610a"))+
+  xlim(0,3)+
+  ylim(0,1)
+
+### copy of the plot for the legend ####
+densityWL <- ggplot()+
+  geom_density(data = results, 
+               mapping =aes(x=dep_before, 
+                            fill = "Before",..scaled..), alpha=.9)+
+  geom_density(data = results, 
+               mapping =aes(x=dep_after, 
+                            fill = "After",..scaled..), alpha =.9)+
+  theme_half_open()+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=15,face="bold"))+
+  scale_fill_manual(name='Estimates',
+                     values=c("#6f948c","#99610a"))
+
+deplegend <- get_legend(densityWL+theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+
+##### process data for yearly dep data ###########
+
+yearly <- results %>%
+  group_by(Year) %>%
+  summarise(sumdep = sum(dep_before),
+            se = sum(SEdep),
+            lci = sum(dep_before_lci),
+            uci = sum(dep_before_uci),
+            type = "1")
+yearly1 <- results %>%
+  group_by(Year) %>%
+  summarise(sumdep = sum(dep_after),
+            se = sum(SEdep1),
+            lci = sum(dep_after_lci),
+            uci = sum(dep_after_uci),
+            type = "2")
+
+yearly <- bind_rows(yearly,yearly1)
+
+dodge1<-position_dodge(width=.9)
+
+
+yearly$type <- factor(yearly$type, levels = c("Before", "After"))
+
+yearlyse <- ggplot(data = yearly)+
+  geom_col(mapping = aes(x=Year,y=sumdep, fill = type), 
+           color = "black", position=dodge1, alpha = 0.9)+
+  geom_errorbar(aes(x = Year, ymin=sumdep - se ,ymax=sumdep + se , 
+                                   fill = type), color = "#636363",
+               lwd=.75,width=0.25,position=dodge1)+
+  labs(y = "Depredations", fill = NULL)+
+  scale_y_continuous(breaks = seq(0,30,5))+
+  scale_fill_manual(labels = c("After", "Before"), 
+                    values = c("#6f948c", "#99610a"))+
+  theme_half_open()+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=15,face="bold"),
+        legend.position = "right")+
+  scale_x_continuous(breaks = seq(2014,2021,1))
+
+yearlyse
+ggsave('Figure2_depredations_v2.jpg', dpi = 600, width = 10, height=8)
+
+
+####### put it together ##############
+plots <- plot_grid(densityNL, yearlyse, nrow =2, align = "hv")  
+figure2<- suppressWarnings(plot_grid(plots,deplegend, ncol = 2, 
+                    align = "hv",rel_widths = c(3, .4)))
+figure2
+#ggsave('Figure2_depredations.jpg', dpi = 600, width = 10, height=8)
+
+# clean up environment
+#suppressWarnings(rm(yearly_before, yearly_lci,yearly_uci, yearly_after, yearly_uci, yearly_lci,deplegend,dodge1,dodge2,plots,yearly,yearly_dat,densityWL,densityNL, yearly_se, yearly_se1))
+
+```
+
+
+## Caterpillar plots of betas
+
+```{r}
+
+betas75<- rownames_to_column(betas75, var = "Parameter")
+betas95 <- rownames_to_column(betas95, var = "Parameter")
+
+bbval <- left_join(betas95,betas75, by = "Parameter")
+
+cat1 <- ggplot(bbval, aes(y = Parameter, x = mean.x))+
+  geom_vline(xintercept = 0, color = "#999999", linetype =2, linewidth = 2)+
+    geom_errorbarh(aes(xmin=`2.5%`, xmax=`97.5%`), 
+                 height=0, color="#99610a", size = 1) +
+  geom_errorbarh(aes(xmin=`12.5%`, xmax=`87.5%`), 
+                 height=0, color="#99610a", size = 2) +
+  geom_point(size = 5, alpha = 1)+
+    aes(color = "(a) Depredation before", alpha = 1)+
+  scale_color_manual(values = "#99610a")+
+  theme_half_open()+
+  scale_y_discrete(labels=c('New Mexico \nintercept',
+                            'Arizona \nintercept',
+                            'Minimum \npack size ', 
+                            'Prey density',
+                            'Annual live-\nstock density'))+
+  scale_x_continuous(breaks=seq(-1.5,1.5,.5), limits = c(-1.5, 1.5))+
+  labs(title = "(a) Before", 
+       x = expression(beta*" coefficient"))+
+    theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=15,face="bold"), 
+        legend.position = "none",
+        title = element_text(size = 20, face = "bold"))
+
+betas75af<- rownames_to_column(betasafter, var = "Parameter")
+betas95af <- rownames_to_column(betasafter75, var = "Parameter")
+
+baval <- left_join(betas95af,betas75af, by = "Parameter")
+
+cat2 <- ggplot(baval, aes(y = Parameter, x = mean.x))+
+  geom_vline(xintercept = 0, color = "#999999", linetype =2, linewidth = 2)+
+    geom_errorbarh(aes(xmin=`2.5%`, xmax=`97.5%`), 
+                 height=0, color="#6f948c", size = 1) +
+  geom_errorbarh(aes(xmin=`12.5%`, xmax=`87.5%`), 
+                 height=0, color="#6f948c", size = 2) +
+  geom_point(size = 5, alpha = 1)+
+  aes(color = "(b) Depredation after", alpha = 1)+
+  scale_color_manual(values = "#6f948c")+
+  theme_half_open()+
+  scale_y_discrete(labels=c('New Mexico \nintercept',
+                            'Arizona \nintercept',
+                            'Minimum \npack size ', 
+                            'Prey density',
+                            'Annual live-\nstock density'))+
+  scale_x_continuous(breaks=seq(-1.5,1.5,.5), limits = c(-1.5, 1.5))+
+  labs(title = "(b) After", 
+       x = expression(beta*" coefficient"))+
+    theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=15,face="bold"), 
+        legend.position = "none",
+        title = element_text(size = 20, face = "bold"))
+
+plot_grid(cat1,cat2)
+
+#ggsave('Figure3. Depredation covariates.jpg', dpi = 600, height =10, width = 20)
+
+
+
+```
+
+## Annual detection & alpha plot
+
+```{r}
+meandet <- p_means$mean_p # get mean probability of detection
+
+figure4a <- ggplot(results, aes(x=Year,group=Year, y=p))+
+  geom_boxplot(varwidth=T, fill = "#003455", alpha = .7)+
+  geom_hline(yintercept = meandet, color = "red",linetype =2, lwd = 1)+
+  theme_half_open()+
+  labs(x="Year", y="Probability of detection", title = "(a)")+
+  scale_x_continuous(breaks=seq(2014,2021,1))+
+  scale_y_continuous(breaks = seq(.3,.8,.1), limits = c(.3, .8))+
+  theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=15,face="bold"),
+        title = element_text(size = 20, face = "bold"))
+
+
+alphas_est<- rownames_to_column(alphas_est, var = "Parameter")
+alphas75 <- rownames_to_column(alphas75, var = "Parameter")
+
+alp <- left_join(alphas_est,alphas75, by = "Parameter")
+alp <- alp[3:5,]
+
+alpha_plot <- ggplot(alp, aes(y = Parameter, x = mean.x))+
+  geom_vline(xintercept = 0, color = "#999999", linetype =2, linewidth = 2)+
+    geom_errorbarh(aes(xmin=`2.5%`, xmax=`97.5%`), 
+                 height=0, color="#003455", size = 1) +
+  geom_errorbarh(aes(xmin=`12.5%`, xmax=`87.5%`), 
+                 height=0, color="#003455", size = 2) +
+  geom_point(size = 5, alpha = 1)+
+    aes(color = "#003455", alpha = 1)+
+  scale_color_manual(values = "#003455")+
+  theme_half_open()+
+  scale_y_discrete(labels=c('Slope', 'Forest\nCover', 'Roads'))+
+  scale_x_continuous(breaks=seq(-1.5,1.5,.5), limits = c(-1.5, 1.5))+
+  labs(title = "(b)", 
+       x = expression(beta*" coefficient"))+
+    theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=15,face="bold"), 
+        legend.position = "none",
+        title = element_text(size = 20, face = "bold"))
+
+
+figure4 <- plot_grid(figure4a,alpha_plot, rel_widths = c(1,1.25))
+figure4
+#ggsave('Figure4.jpg', dpi = 600, width = 18, height=10)
+
+```
+
